@@ -1,186 +1,139 @@
 import networkx as nx
+import math
+from difflib import SequenceMatcher
 
 
-# ==========================================================
-# Graph Reasoning State (GRS)
-# Stores the evolving thought graph
-# ==========================================================
+def text_similarity(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-class GraphReasoningState:
 
-    def __init__(self):
-        self.thought_graph = nx.DiGraph()
+def softmax(scores):
 
-    def add_thought(self, node_id, text, score=0):
-        self.thought_graph.add_node(node_id, text=text, score=score)
+    exp_scores = [math.exp(s) for s in scores]
+    total = sum(exp_scores)
 
-    def add_edge(self, src, dst):
-        self.thought_graph.add_edge(src, dst)
+    return [s / total for s in exp_scores]
 
-    def get_thoughts(self):
-        return list(self.thought_graph.nodes(data=True))
 
+def get_claim_node(G):
 
-# ==========================================================
-# Extract Argument Components
-# ==========================================================
+    for node, data in G.nodes(data=True):
+        if data.get("label") == "Claim":
+            return node, data.get("text")
 
-def extract_components(argument_graph):
+    return None, None
 
-    claims = []
-    evidences = []
-    counterclaims = []
-    rebuttals = []
 
-    for node, data in argument_graph.nodes(data=True):
+def extract_reasoning_paths(G, claim_node):
 
-        label = data.get("label")
+    paths = []
 
-        if label == "Claim":
-            claims.append(data.get("text"))
+    for node in G.nodes():
 
-        elif label == "Evidence":
-            evidences.append(data.get("text"))
+        if node == claim_node:
+            continue
 
-        elif label == "Counterclaim":
-            counterclaims.append(data.get("text"))
+        try:
+            path = nx.shortest_path(G, source=node, target=claim_node)
 
-        elif label == "Rebuttal":
-            rebuttals.append(data.get("text"))
+            if len(path) >= 2:
+                paths.append(path)
 
-    return claims, evidences, counterclaims, rebuttals
+        except:
+            pass
 
+    return paths
 
-# ==========================================================
-# Thought Generation
-# ==========================================================
 
-def generate_thoughts(claim, evidences):
+def path_to_reasoning(G, path):
 
-    thoughts = []
+    texts = []
 
-    for ev in evidences:
+    for node in path:
 
-        thought = f"""
-Evidence: "{ev}"
+        node_data = G.nodes[node]
+        label = node_data.get("label")
+        text = node_data.get("text")
 
-This evidence contributes to supporting the claim:
-"{claim}"
-"""
+        texts.append(f"{label}: {text}")
 
-        thoughts.append(thought.strip())
+    reasoning = "\n\n".join(texts)
 
-    return thoughts
+    return reasoning
 
 
-# ==========================================================
-# Thought Expansion
-# ==========================================================
+def score_path(reasoning, claim, other_paths):
 
-def expand_thought(thought, claim):
+    relevance = text_similarity(reasoning, claim)
 
-    expansion = f"""
-{thought}
+    length = len(reasoning.split())
 
-Therefore this reasoning strengthens the argument that:
-"{claim}"
-"""
+    completeness = min(length / 40, 1)
 
-    return expansion.strip()
+    diversity_scores = [
+        text_similarity(reasoning, p)
+        for p in other_paths
+    ]
 
+    if diversity_scores:
+        diversity = 1 - max(diversity_scores)
+    else:
+        diversity = 1
 
-# ==========================================================
-# Thought Scoring
-# ==========================================================
+    score = (
+        0.5 * relevance +
+        0.3 * completeness +
+        0.2 * diversity
+    )
 
-def score_thought(thought):
+    return score
 
-    score = 0.5
 
-    length = len(thought.split())
+def run_got_reasoning(G):
 
-    if length > 20:
-        score += 0.2
+    claim_node, claim_text = get_claim_node(G)
 
-    if "evidence" in thought.lower():
-        score += 0.2
+    if claim_node is None:
+        return {"error": "No claim detected in argument graph"}
 
-    if "therefore" in thought.lower():
-        score += 0.1
+    paths = extract_reasoning_paths(G, claim_node)
 
-    return min(score, 1.0)
+    if not paths:
+        return {"error": "No reasoning paths found"}
 
+    reasoning_paths = []
 
-# ==========================================================
-# Controller (Main GoT Pipeline)
-# ==========================================================
+    previous = []
 
-def run_got_reasoning(argument_graph):
+    for p in paths:
 
-    claims, evidences, counterclaims, rebuttals = extract_components(argument_graph)
+        reasoning = path_to_reasoning(G, p)
 
-    if not claims:
-        return {"error": "No claims detected"}
+        score = score_path(reasoning, claim_text, previous)
 
-    claim = claims[0]
+        reasoning_paths.append({
+            "text": reasoning,
+            "score": score,
+            "path": p
+        })
 
-    if not evidences:
-        evidences = ["Implicit reasoning from essay context"]
+        previous.append(reasoning)
 
-    grs = GraphReasoningState()
+    scores = [p["score"] for p in reasoning_paths]
 
-    # ------------------------------------------------------
-    # Stage 1: Generate initial thoughts
-    # ------------------------------------------------------
+    probabilities = softmax(scores)
 
-    thoughts = generate_thoughts(claim, evidences)
-
-    previous_node = None
-
-    for i, thought in enumerate(thoughts):
-
-        score = score_thought(thought)
-
-        node_id = f"T{i}"
-
-        grs.add_thought(node_id, thought, score)
-
-        if previous_node:
-            grs.add_edge(previous_node, node_id)
-
-        previous_node = node_id
-
-    # ------------------------------------------------------
-    # Stage 2: Expand reasoning graph
-    # ------------------------------------------------------
-
-    expanded_nodes = []
-
-    for node_id, data in grs.get_thoughts():
-
-        expanded = expand_thought(data["text"], claim)
-
-        score = score_thought(expanded)
-
-        new_id = f"{node_id}_E"
-
-        expanded_nodes.append((node_id, new_id, expanded, score))
-
-    for src, nid, text, score in expanded_nodes:
-
-        grs.add_thought(nid, text, score)
-        grs.add_edge(src, nid)
-
-    # ------------------------------------------------------
-    # Select best thought
-    # ------------------------------------------------------
-
-    thoughts = grs.get_thoughts()
-
-    best = max(thoughts, key=lambda x: x[1]["score"])
+    for i in range(len(reasoning_paths)):
+        reasoning_paths[i]["probability"] = probabilities[i]
+        
+    best = max(reasoning_paths, key=lambda x: (x["probability"], x["score"], -len(x["path"]))
+)
 
     return {
-        "thoughts": thoughts,
-        "best_thought": best[1]["text"],
-        "best_score": best[1]["score"]
+        "thoughts": [(i, reasoning_paths[i]) for i in range(len(reasoning_paths))],
+        "paths": reasoning_paths,
+        "best_thought": best["text"],
+        "best_score": best["score"],
+        "best_probability": best["probability"],
+        "best_path": best["path"]
     }

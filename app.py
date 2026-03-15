@@ -16,6 +16,8 @@ Requirements:
   - GOOGLE_API_KEY set in environment
 """
 
+from importlib.resources import path
+
 import streamlit as st
 import pandas as pd
 import networkx as nx
@@ -58,17 +60,17 @@ st.markdown(
     **Graph-of-Thought (GoT) Essay Reasoning System**
 
     Analyze essays using a hybrid pipeline of:
-    - 🔍 Transformer-based discourse classification
-    - 🧩 Graph-of-Thought reasoning with Google Gemini
-    - 📊 Interactive argument structure visualization
-    - 💬 Automatic feedback and quality scoring
+    - Transformer-based discourse classification
+    - Graph-of-Thought reasoning with Google Gemini
+    - Interactive argument structure visualization
+    - Automatic feedback and quality scoring
     """
 )
 
 # ============================================================
 # Sidebar for Input
 # ============================================================
-st.sidebar.header("📝 Input Essay Text")
+st.sidebar.header("Input Essay Text")
 essay_text = st.sidebar.text_area(
     "Paste your essay here 👇",
     height=300,
@@ -76,10 +78,10 @@ essay_text = st.sidebar.text_area(
     value=st.session_state.essay_text
 )
 
-analyze_button = st.sidebar.button("🚀 Analyze Essay", type="primary")
+analyze_button = st.sidebar.button("Analyze Essay", type="primary")
 
 # Clear analysis button
-if st.sidebar.button("🔄 Clear Analysis"):
+if st.sidebar.button("Clear Analysis"):
     st.session_state.analysis_complete = False
     st.session_state.segments_df = None
     st.session_state.essay_text = ""
@@ -95,7 +97,7 @@ def load_models():
         model, tokenizer = load_discourse_model()
         return model, tokenizer
     except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
+        st.error(f" Error loading model: {str(e)}")
         st.info("Make sure the 'stage1_model' folder is in the same directory as app.py")
         return None, None
 
@@ -226,7 +228,7 @@ def build_argument_graph(segments_df):
 # ============================================================
 def visualize_argument_graph(segments_df):
     """Create interactive visualization of argument structure."""
-    st.subheader("📊 Argument Structure Graph")
+    st.subheader("Argument Structure Graph")
     
     G = build_argument_graph(segments_df)
     
@@ -325,10 +327,10 @@ def visualize_argument_graph(segments_df):
     # --- START NEW LEGEND ---
     st.markdown("""
     **Legend:**
-    - 🔴 **Unsupported Claim**: A claim with no evidence pointing to it.
-    - 🟢 Green arrows: Support relationships
-    - 🔴 Red dashed: Opposition relationships
-    - 🟠 Orange dotted: Refutation relationships
+    -  **Unsupported Claim**: A claim with no evidence pointing to it.
+    - Green arrows: Support relationships
+    - Red dashed: Opposition relationships
+    - Orange dotted: Refutation relationships
     - Gray dotted: General flow (connecting consecutive argument steps)
     """)
     # --- END NEW LEGEND ---
@@ -372,7 +374,7 @@ def display_explanation_with_feedback(title, content, explanation_type):
 # MAIN PIPELINE EXECUTION
 # ============================================================
 if model is None or tokenizer is None:
-    st.error("❌ Cannot proceed without model. Please check model loading errors above.")
+    st.error("Cannot proceed without model. Please check model loading errors above.")
     st.stop()
 
 if analyze_button and essay_text.strip():
@@ -382,85 +384,119 @@ if analyze_button and essay_text.strip():
     # ========================================================
     # Step 1: Discourse Analysis
     # ========================================================
-    st.subheader("📖 Step 1: Discourse Analysis")
+    st.subheader("Step 1: Discourse Analysis")
     with st.spinner("Running transformer model..."):
         segments_df = predict_discourse_segments(essay_text, model, tokenizer)
         st.session_state.segments_df = segments_df
-        st.success("✅ Discourse analysis complete!")
+        st.success("Discourse analysis complete!")
 
     st.dataframe(segments_df, use_container_width=True)
     
     # Identify unsupported claims
     claims = segments_df[segments_df['predicted_discourse_type'] == 'Claim']
     if not claims.empty:
-        st.info(f"📌 Found {len(claims)} claim(s) in your essay")
+        st.info(f"Found {len(claims)} claim(s) in your essay")
 
     # ========================================================
     # Step 2: Argument Graph Visualization
     # ========================================================
     G = visualize_argument_graph(segments_df)
+    
+    def visualize_reasoning_path(G, path):
+        subgraph = G.subgraph(path)
+        pos = nx.spring_layout(subgraph, k=1.6, seed=42)
+        fig, ax = plt.subplots(figsize=(14,10))
+        
+        nx.draw_networkx_nodes(
+        subgraph,
+        pos,
+        node_size=2600,
+        node_color="#B4E7F8",
+        ax=ax
+        )
+        
+        nx.draw_networkx_edges(
+        subgraph,
+        pos,
+        arrows=True,
+        arrowsize=20,
+        width=2,
+        ax=ax
+        )
+        
+        labels = {
+            n: f"{subgraph.nodes[n]['label']}{n}"
+            for n in subgraph.nodes()
+            }
+        
+        nx.draw_networkx_labels(
+        subgraph,
+        pos,
+        labels,
+        font_size=11,
+        font_weight="bold",
+        ax=ax
+        )
+
+        ax.axis("off")
+
+        return fig
 
     # ========================================================
     # Step 3: Graph-of-Thought Expansion (NEW)
     # ========================================================
-    st.subheader("🧠 Graph-of-Thought Reasoning")
+    st.subheader("Graph-of-Thought Reasoning")
     got_results = run_got_reasoning(G)
     if "error" in got_results:
         st.warning(got_results["error"])
 
     else:
 
-    # ==============================
-    # Claim Section
-    # ==============================
-
-        claim_text = got_results["best_thought"].split("claim:")[-1]
-
-        st.markdown("### 📌 Central Claim")
-        st.info(claim_text)
-
-        st.markdown("---")
-
-    # ==============================
-    # Reasoning Paths
-    # ==============================
-
-        st.markdown("### 🔀 Reasoning Paths")
+        st.markdown("### Reasoning Paths")
 
         thoughts = got_results["thoughts"]
 
         for i, node in enumerate(thoughts):
 
-            thought_text = node[1]["text"]
-            score = node[1]["score"]
+            data = node[1]
 
-            with st.container():
+            score = data["score"]
+            prob = data["probability"]
+            path = data["path"]
 
-                col1, col2 = st.columns([6,1])
+            st.markdown(f"#### Path {i+1}")
 
-                with col1:
-                    st.markdown(f"**Thought {i+1}**")
-                    st.markdown(thought_text)
+            path_labels = [G.nodes[n]["label"] for n in path]
 
-                with col2:
-                    st.metric("Score", round(score,2))
+            st.code(" → ".join(path_labels))
 
-                st.progress(score)
+            fig = visualize_reasoning_path(G, path)
 
-                st.markdown("---")
+            st.pyplot(fig)
 
-    # ==============================
-    # Best Reasoning
-    # ==============================
+            col1, col2 = st.columns(2)
+
+            col1.metric("Score", f"{score:.2f}")
+            col2.metric("Probability", f"{prob:.2f}")
+
+            st.markdown("---")
 
         st.markdown("### ⭐ Best Reasoning Path")
 
-        st.success(got_results["best_thought"])
+        best_nodes = got_results["best_path"]
+
+        best_labels = [G.nodes[n]["label"] for n in best_nodes]
+
+        st.code(" → ".join(best_labels))
+
+        fig = visualize_reasoning_path(G, best_nodes)
+
+        st.pyplot(fig)
         
     # ========================================================
     # Visual Reasoning Graphs (Aggregation + Refinement)
     # ========================================================
-    st.markdown("### 🧠 Visual GoT Reasoning Graphs")
+    st.markdown("### Visual GoT Reasoning Graphs")
 
     claims_list = segments_df[segments_df['predicted_discourse_type'] == 'Claim']['text'].tolist()
     evidences_list = segments_df[segments_df['predicted_discourse_type'] == 'Evidence']['text'].tolist()
@@ -469,7 +505,7 @@ if analyze_button and essay_text.strip():
     # =============================
     
     if len(evidences_list) >= 2:
-        st.markdown("#### 🔷 Aggregation Graph (Multiple Evidence → Claim)")
+        st.markdown("#### Aggregation Graph (Multiple Evidence → Claim)")
 
         G_agg = nx.DiGraph()
 
@@ -523,105 +559,105 @@ if analyze_button and essay_text.strip():
     # ==========================
     # Refinement Graph (Option A)
     # ==========================
-    if len(evidences_list) > 0:
-        st.markdown("#### 🟣 Refinement Graph (Premise → Logical Path → Claim)")
+    # if len(evidences_list) > 0:
+    #     st.markdown("#### Refinement Graph (Premise → Logical Path → Claim)")
 
-        G_ref = nx.DiGraph()
+    #     G_ref = nx.DiGraph()
 
-        premise = evidences_list[0]
+    #     premise = evidences_list[0]
 
-        # Nodes
-        G_ref.add_node("Premise", label="Premise", text=premise)
-        G_ref.add_node("Initial Link", label="Initial Link", text="Basic logical relation")
-        G_ref.add_node(
-            "Refined Logic",
-            label="Refined Logic",
-            text="Improved explanation"
-        )
-        G_ref.add_node("Claim", label="Claim", text=claims_list[0])
+    #     # Nodes
+    #     G_ref.add_node("Premise", label="Premise", text=premise)
+    #     G_ref.add_node("Initial Link", label="Initial Link", text="Basic logical relation")
+    #     G_ref.add_node(
+    #         "Refined Logic",
+    #         label="Refined Logic",
+    #         text="Improved explanation"
+    #     )
+    #     G_ref.add_node("Claim", label="Claim", text=claims_list[0])
 
-        # Edges
-        G_ref.add_edge("Premise", "Initial Link")
-        G_ref.add_edge("Initial Link", "Refined Logic")
-        G_ref.add_edge("Refined Logic", "Claim")
+    #     # Edges
+    #     G_ref.add_edge("Premise", "Initial Link")
+    #     G_ref.add_edge("Initial Link", "Refined Logic")
+    #     G_ref.add_edge("Refined Logic", "Claim")
 
-        figR, axR = plt.subplots(figsize=(12, 6))
-        posR = nx.spring_layout(G_ref, seed=10, k=1.3)
+    #     figR, axR = plt.subplots(figsize=(12, 6))
+    #     posR = nx.spring_layout(G_ref, seed=10, k=1.3)
 
-        # Draw nodes
-        for node in G_ref.nodes():
-            nx.draw_networkx_nodes(
-                G_ref, posR, nodelist=[node],
-                node_color="#E6CCFF" if "Link" in node or "Logic" in node else "#B4F4B4",
-                node_size=3000, ax=axR
-            )
+    #     # Draw nodes
+    #     for node in G_ref.nodes():
+    #         nx.draw_networkx_nodes(
+    #             G_ref, posR, nodelist=[node],
+    #             node_color="#E6CCFF" if "Link" in node or "Logic" in node else "#B4F4B4",
+    #             node_size=3000, ax=axR
+    #         )
 
-        nx.draw_networkx_edges(G_ref, posR, arrows=True, arrowsize=22, width=2, ax=axR)
+    #     nx.draw_networkx_edges(G_ref, posR, arrows=True, arrowsize=22, width=2, ax=axR)
 
-        ref_labels = {
-            node: f"{G_ref.nodes[node]['label']}\n{G_ref.nodes[node]['text'][:60]}..."
-            for node in G_ref.nodes()
-        }
-        nx.draw_networkx_labels(G_ref, posR, ref_labels, font_size=9, ax=axR)
+    #     ref_labels = {
+    #         node: f"{G_ref.nodes[node]['label']}\n{G_ref.nodes[node]['text'][:60]}..."
+    #         for node in G_ref.nodes()
+    #     }
+    #     nx.draw_networkx_labels(G_ref, posR, ref_labels, font_size=9, ax=axR)
 
-        axR.axis("off")
-        st.pyplot(figR)
+    #     axR.axis("off")
+    #     st.pyplot(figR)
 
 
-    if len(claims_list) == 0:
-        st.warning("⚠️ No claims detected – please provide argumentative text.")
-    else:
-        # Aggregation reasoning
-        if len(evidences_list) >= 2:
-            st.markdown("### 🧠 Aggregation Explanation")
-            with st.spinner("Analyzing how multiple evidence points support your claim..."):
-                agg_output = run_aggregation_explanation(
-                    claims_list[0], 
-                    evidences_list[:3]
-                )
-            display_explanation_with_feedback(
-                "How Multiple Premises Support Your Claim:",
-                agg_output,
-                "aggregation"
-            )
+    # if len(claims_list) == 0:
+    #     st.warning("No claims detected – please provide argumentative text.")
+    # else:
+    #     # Aggregation reasoning
+    #     if len(evidences_list) >= 2:
+    #         st.markdown("### Aggregation Explanation")
+    #         with st.spinner("Analyzing how multiple evidence points support your claim..."):
+    #             agg_output = run_aggregation_explanation(
+    #                 claims_list[0], 
+    #                 evidences_list[:3]
+    #             )
+    #         display_explanation_with_feedback(
+    #             "How Multiple Premises Support Your Claim:",
+    #             agg_output,
+    #             "aggregation"
+    #         )
         
-        # Refinement reasoning
-        if len(evidences_list) > 0:
-            st.markdown("### 🔍 Refinement Explanation")
-            with st.spinner("Refining the logical link between premise and claim..."):
-                ref_output = run_refinement_explanation(
-                    claims_list[0], 
-                    evidences_list[0]
-                )
-            display_explanation_with_feedback(
-                "Logical Link Between Premise and Claim:",
-                ref_output,
-                "refinement"
-            )
+    #     # Refinement reasoning
+    #     if len(evidences_list) > 0:
+    #         st.markdown("### Refinement Explanation")
+    #         with st.spinner("Refining the logical link between premise and claim..."):
+    #             ref_output = run_refinement_explanation(
+    #                 claims_list[0], 
+    #                 evidences_list[0]
+    #             )
+    #         display_explanation_with_feedback(
+    #             "Logical Link Between Premise and Claim:",
+    #             ref_output,
+    #             "refinement"
+    #         )
 
-    # ========================================================
-    # Step 5: Overall Feedback
-    # ========================================================
-    st.subheader("💬 Step 3: Overall Feedback")
-    with st.spinner("Generating comprehensive feedback via Gemini..."):
-        feedback = run_feedback_explanation(essay_text)
+    # # ========================================================
+    # # Step 5: Overall Feedback
+    # # ========================================================
+    # st.subheader("Step 3: Overall Feedback")
+    # with st.spinner("Generating comprehensive feedback via Gemini..."):
+    #     feedback = run_feedback_explanation(essay_text)
     
-    display_explanation_with_feedback(
-        "Comprehensive Essay Feedback:",
-        feedback,
-        "overall_feedback"
-    )
+    # display_explanation_with_feedback(
+    #     "Comprehensive Essay Feedback:",
+    #     feedback,
+    #     "overall_feedback"
+    # )
 
-    st.success("✅ Analysis complete!")
+    # st.success("Analysis complete!")
 
 elif analyze_button:
-    st.warning("⚠️ Please enter some essay text first!")
+    st.warning("Please enter some essay text first!")
 
 # ============================================================
 # Display previous analysis if exists
 # ============================================================
 if st.session_state.analysis_complete and st.session_state.segments_df is not None and not analyze_button:
-    st.info("📌 Showing previous analysis. Click 'Analyze Essay' to run a new analysis.")
+    st.info("Showing previous analysis. Click 'Analyze Essay' to run a new analysis.")
     st.dataframe(st.session_state.segments_df, use_container_width=True)
 
 # ============================================================
@@ -629,10 +665,10 @@ if st.session_state.analysis_complete and st.session_state.segments_df is not No
 # ============================================================
 if len(st.session_state.feedback_log) > 0:
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 Feedback Log")
+    st.sidebar.subheader("Feedback Log")
     st.sidebar.markdown(f"Total feedback entries: {len(st.session_state.feedback_log)}")
     
-    if st.sidebar.button("💾 Export Feedback"):
+    if st.sidebar.button("Export Feedback"):
         feedback_json = json.dumps(st.session_state.feedback_log, indent=2)
         st.sidebar.download_button(
             label="Download Feedback JSON",
@@ -646,5 +682,5 @@ if len(st.session_state.feedback_log) > 0:
 # ============================================================
 st.markdown("---")
 st.markdown(
-    "Developed with ❤️ using **Transformers** + **LangGraph** + **Gemini**"
+    "Developed using **Transformers** + **LangGraph** + **Gemini**"
 )
