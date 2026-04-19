@@ -210,71 +210,44 @@ def generate_teacher_feedback(df: pd.DataFrame, verdict: dict, stats: dict, devi
 
 def compute_subscores(df: pd.DataFrame, stats: dict) -> dict:
     """
-    Compute detailed sub-scores (each 0–10) for the score dashboard.
+    Compute sub-scores aligned with the Toulmin scoring traits.
+    Each score is 0-10, derived directly from the same trait functions
+    used in got_engine._compute_toulmin_score() to ensure consistency.
+
+    The six traits map to:
+      T1 Claim Clarity         -> "Claim Clarity"
+      T2 Evidence Quality      -> "Evidence Quality"
+      T3 Warrant/Reasoning     -> "Warrant & Reasoning"
+      T4 Counterargument       -> "Counterargument"
+      T5 Rebuttal Quality      -> "Rebuttal Quality"
+      T6 Structural Cohesion   -> "Structural Cohesion"
     """
-    total = max(stats.get("total_sentences", 1), 1)
-    ev_cnt    = stats.get("evidence_count", 0)
-    strong    = stats.get("strong_evidence_count", 0)
-    weak_ev   = stats.get("weak_evidence_count", 0)
-    unsup     = stats.get("unsupported_count", 0)
-    fallacy   = stats.get("fallacy_count", 0)
-    cc        = stats.get("counterclaim_count", 0)
-    reb       = stats.get("rebuttal_count", 0)
-    missing   = stats.get("missing_evidence_count", 0)
-    claim_cnt = max(stats.get("claim_count", 1), 1)
-    bias      = len(df[df["category"] == "Bias Indicator"])
-
-    # Evidence Coverage: how well claims are backed by quality evidence
-    # Strong (cited/statistical) = good. Plain = ok. Weak (anecdotal) = barely.
-    # No evidence at all = 0. Penalise unsupported claims and missing evidence.
-    plain_ev = max(0, ev_cnt - strong - weak_ev)
-    ev_raw = strong * 1.2 + plain_ev * 0.6 + weak_ev * 0.15
-    # Scale: 1 strong evidence per claim = ~7/10. 2+ = ~10/10.
-    ev_score = min(10.0, (ev_raw / max(claim_cnt, 1)) * 7.0)
-    # Penalise missing evidence gaps
-    ev_score = max(0.0, ev_score - missing * 0.8 - (1.0 if strong == 0 and ev_cnt > 0 else 0))
-
-    # Logical Consistency: start at 10, heavy penalties for each issue
-    logic_score = max(0.0, 10.0 - fallacy * 2.5 - unsup * 1.5 - missing * 0.6)
-
-    # Counterargument Quality: 0 if no counterclaims at all (big penalty for ignoring opposition)
-    if cc == 0:
-        cc_score = 0.0   # completely ignores opposing views
-    elif reb == 0:
-        cc_score = min(4.0, cc * 2.0)   # raises but doesn't rebut
-    else:
-        cc_score = min(10.0, cc * 3.5 + reb * 2.5)
-
-    # Bias score: penalise each bias indicator found
-    bias_score = max(0.0, 10.0 - bias * 2.5)
-
-    # Readability: based on average sentence length
-    # (textstat usually unavailable in offline env)
-    avg_len = df["sentence"].str.split().str.len().mean() if len(df) > 0 else 15
-    # Ideal sentence length ~15-20 words. Very short (<8) or very long (>35) score lower.
-    if avg_len < 8:
-        read_score = 4.0
-    elif avg_len <= 22:
-        read_score = 8.5
-    elif avg_len <= 30:
-        read_score = 6.5
-    else:
-        read_score = max(2.0, 10.0 - (avg_len - 30) * 0.3)
-
-    # Grammar: penalise for missing capitalisation, double spaces, fragments
-    grammar_errors = sum(
-        1 for s in df["sentence"]
-        if (len(s) > 0 and not s[0].isupper()) or s.count("  ") > 0 or len(s.split()) < 4
+    from got_engine import (
+        _score_T1_claim_clarity, _score_T2_evidence_quality,
+        _score_T3_warrant_reasoning, _score_T4_counterargument,
+        _score_T5_rebuttal_quality, _score_T6_structural_cohesion
     )
-    grammar_score = max(0.0, 10.0 - grammar_errors * 1.2)
+
+    # We need ranked_branches for T3 — use a dummy if not available
+    dummy_branches = [{"scores": {"overall": 0.5}}]
+
+    t1_raw, t1_max, _ = _score_T1_claim_clarity(stats)
+    t2_raw, t2_max, _ = _score_T2_evidence_quality(stats)
+    t3_raw, t3_max, _ = _score_T3_warrant_reasoning(stats, dummy_branches)
+    t4_raw, t4_max, _ = _score_T4_counterargument(stats)
+    t5_raw, t5_max, _ = _score_T5_rebuttal_quality(stats)
+    t6_raw, t6_max, _ = _score_T6_structural_cohesion(stats, df)
+
+    def to_10(raw, mx):
+        return round(min(10.0, max(0.0, (raw / mx) * 10.0)), 1)
 
     return {
-        "Evidence Coverage":      round(min(10.0, max(0.0, ev_score)), 1),
-        "Logical Consistency":    round(min(10.0, max(0.0, logic_score)), 1),
-        "Counterargument Quality":round(min(10.0, max(0.0, cc_score)), 1),
-        "Bias Score":             round(min(10.0, max(0.0, bias_score)), 1),
-        "Readability":            round(min(10.0, max(0.0, read_score)), 1),
-        "Grammar":                round(min(10.0, max(0.0, grammar_score)), 1),
+        "T1 Claim Clarity":       to_10(t1_raw, t1_max),
+        "T2 Evidence Quality":    to_10(t2_raw, t2_max),
+        "T3 Warrant & Reasoning": to_10(t3_raw, t3_max),
+        "T4 Counterargument":     to_10(t4_raw, t4_max),
+        "T5 Rebuttal Quality":    to_10(t5_raw, t5_max),
+        "T6 Structural Cohesion": to_10(t6_raw, t6_max),
     }
 
 

@@ -171,17 +171,26 @@ def build_unsupported_claim_graph(df: pd.DataFrame) -> nx.DiGraph:
 
 
 def build_hidden_assumption_graph(df: pd.DataFrame) -> nx.DiGraph:
-    """Surfaces hidden assumptions linked to their host claims."""
+    """Surfaces hidden assumptions linked to their host claims.
+    Only adds assumption nodes if the essay actually contains
+    classified Assumption/Premise sentences."""
     G = build_argument_graph(df)
-    # Add explicit "hidden assumption" nodes for weak claims without assumption tags
+
+    # Only flag hidden assumptions if real assumptions were detected
+    real_assumptions = df[df["category"].isin(["Assumption", "Premise"])]
+    if real_assumptions.empty:
+        # No assumptions in essay — return standard graph unchanged
+        return G
+
+    # Add hidden assumption nodes only for claims without citations
     for idx, row in df.iterrows():
         if row["category"] in ("Claim", "Unsupported Claim") and not row.get("has_citation"):
             ha_id = f"ha_{idx}"
             G.add_node(ha_id,
-                       label    = "Hidden Assumption",
-                       full     = "This claim may rest on an unstated assumption.",
-                       category = "Assumption",
-                       color    = NODE_COLORS["Assumption"],
+                       label      = "Hidden Assumption",
+                       full       = "This claim may rest on an unstated assumption.",
+                       category   = "Assumption",
+                       color      = NODE_COLORS["Assumption"],
                        confidence = 0.5)
             G.add_edge(ha_id, f"node_{idx}", relation="assumes", weight=0.7)
     return G

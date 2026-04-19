@@ -118,7 +118,7 @@ def render_dashboard(df, stats, verdict, subscores, keywords, topic, best_branch
     st.markdown("---")
 
     # Score bars — rendered one at a time to avoid raw HTML issue
-    st.markdown("""<div style="font-family:'Syne',sans-serif;font-size:1.05rem;font-weight:700;margin-bottom:1rem">📈 Score Breakdown</div>""",
+    st.markdown("""<div style="font-family:'Syne',sans-serif;font-size:1.05rem;font-weight:700;margin-bottom:1rem">📐 Toulmin Trait Scores <span style="font-size:.72rem;font-weight:400;color:#9298ae;font-family:'DM Mono',monospace">Toulmin (1958) — 6 traits, raw 0-16 → normalised 0-10</span></div>""",
         unsafe_allow_html=True)
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     render_score_bars(subscores)

@@ -7,7 +7,7 @@ import pandas as pd
 from styles import tag_html, score_bar_html, graph_insight_html
 from visualization import (
     discourse_distribution_chart, subscore_chart,
-    got_branch_timeline, branch_score_radar,
+    got_branch_timeline,
     devil_summary_chart, sentence_heatmap,
 )
 
@@ -155,11 +155,7 @@ def render_teacher_dashboard(
                 "Each row is a reasoning branch. Each dot is a reasoning step coloured by discourse type. "
                 "More steps = more developed reasoning chain. Compare branch depth across rows."
             ), unsafe_allow_html=True)
-            st.plotly_chart(branch_score_radar(branches), use_container_width=True)
-            st.markdown(graph_insight_html(
-                "Radar chart: larger polygon = stronger branch. Confidence = how certain the reasoning is. "
-                "Completeness = how many key discourse types are covered. Diversity = originality of the path."
-            ), unsafe_allow_html=True)
+            # Radar chart removed
 
             st.markdown("**Reasoning Branches Detail**")
             for b_idx, branch in enumerate(branches):
@@ -242,23 +238,18 @@ def render_teacher_dashboard(
                     else:
                         cls = "feedback-missing"
 
-                    sentence_html = (
-                        f'<div style="font-size:.82rem;margin-bottom:.3rem;'
-                        f'color:var(--text-secondary)">{finding["sentence"]}</div>'
-                        if finding.get("sentence") else ""
+                    sent_t  = f'"{finding["sentence"][:100]}{"…" if len(finding["sentence"])>100 else ""}"' if finding.get("sentence") else ""
+                    note_t  = finding.get('teacher_note','')
+                    label_t = finding.get('type','') + ' · ' + finding.get('subtype','')
+                    st.markdown(
+                        f'<div style="border-left:3px solid {sev_color};background:rgba(0,0,0,0.12);'
+                        f'border-radius:8px;padding:.75rem 1rem;margin:.4rem 0">'
+                        f'<div style="font-size:.7rem;font-family:monospace;opacity:.6;margin-bottom:.3rem">{label_t}</div>'
+                        + (f'<div style="font-size:.82rem;color:#9298ae;font-style:italic;margin-bottom:.3rem">{sent_t}</div>' if sent_t else "")
+                        + f'<div style="font-size:.87rem">{note_t}</div>'
+                        + '</div>',
+                        unsafe_allow_html=True
                     )
-                    st.markdown(f"""
-                    <div class="feedback-item {cls}">
-                        <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.3rem">
-                            <span class="tag" style="background:rgba(252,92,101,.1);
-                                color:{sev_color};border:1px solid {sev_color}40;font-size:.68rem">
-                                {finding.get('type','')} · {finding.get('subtype','')}
-                            </span>
-                        </div>
-                        {sentence_html}
-                        <div style="font-size:.82rem">{finding.get('teacher_note','')}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
 
     # ── Tab: Deep Analysis ────────────────────────────────────────────────────
     with tab_deep:

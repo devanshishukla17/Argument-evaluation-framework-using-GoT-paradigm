@@ -1,287 +1,675 @@
 """
-got_engine.py — True Graph-of-Thought (GoT) reasoning engine.
+got_engine.py — TRUE Graph-of-Thought (GoT) engine using the Claude API.
 
-Generates multiple reasoning branches, scores each on confidence /
-diversity / completeness, merges them, and produces a final verdict.
+What makes this REAL GoT (Besta et al., 2023):
+  1. GENERATE   — LLM independently generates N thought nodes (reasoning perspectives)
+                  without knowing about the others.
+  2. SCORE      — LLM scores each node for logical validity, evidence quality, completeness.
+  3. AGGREGATE  — High-scoring nodes are connected into a graph; the LLM then reasons
+                  OVER that graph structure to produce a synthesised verdict.
+  4. REFINE     — The LLM is shown the aggregated graph and asked to identify the single
+                  strongest reasoning path and fill any remaining gaps.
+
+This replaces the old fake GoT (hardcoded branch templates with hardcoded confidence values).
+
+Scoring follows the Toulmin Argumentation Model (Toulmin, 1958):
+  T1 Claim Clarity (0-3), T2 Evidence Quality (0-4), T3 Warrant/Reasoning (0-3),
+  T4 Counterargument (0-2), T5 Rebuttal Quality (0-2), T6 Structural Cohesion (0-2)
+  Total raw 0-16, normalised to 0-10.
 """
 
 from __future__ import annotations
-import math
+import json
+import re
+import time
+import os
 import pandas as pd
-
+from groq import Groq
 
 # ---------------------------------------------------------------------------
-# Branch generation helpers
+# Claude client
 # ---------------------------------------------------------------------------
+_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_MODEL = "llama-3.3-70b-versatile"
+
 
 def _short(text: str, max_len: int = 55) -> str:
-    return text[:max_len] + "…" if len(text) > max_len else text
+    return text[:max_len] + "..." if len(text) > max_len else text
 
 
-def generate_branches(df: pd.DataFrame) -> list[dict]:
-    branches: list[dict] = []
+def _call_groq(system: str, user: str, max_tokens: int = 1200) -> str:
+    for attempt in range(2):
+        try:
+            msg = _client.chat.completions.create(
+                model=_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ],
+                max_tokens=max_tokens,
+                temperature=0.3
+            )
 
-    claims        = df[df["category"].isin(["Claim","Position","Unsupported Claim"])]["sentence"].tolist()
-    evidence      = df[df["category"].isin(["Evidence","Strong Evidence","Supporting Fact"])]["sentence"].tolist()
-    weak_ev       = df[df["category"] == "Weak Evidence"]["sentence"].tolist()
-    counterclaims = df[df["category"] == "Counterclaim"]["sentence"].tolist()
-    rebuttals     = df[df["category"] == "Rebuttal"]["sentence"].tolist()
-    assumptions   = df[df["category"].isin(["Assumption","Premise"])]["sentence"].tolist()
-    effects       = df[df["category"] == "Cause-Effect Relation"]["sentence"].tolist()
-    conclusions   = df[df["category"] == "Concluding Statement"]["sentence"].tolist()
+            return msg.choices[0].message.content.strip()
 
-    # ── Branch 1: Main Causal / Support Branch ────────────────────────────────
-    if claims:
-        steps = []
-        for i, claim in enumerate(claims[:3]):
-            steps.append({"id":f"b0_c{i}","label":_short(claim),"category":"Claim","confidence":0.75})
-            if i < len(evidence):
-                steps.append({"id":f"b0_e{i}","label":_short(evidence[i]),"category":"Evidence","confidence":0.82})
-            if i < len(effects):
-                steps.append({"id":f"b0_ef{i}","label":_short(effects[i]),"category":"Cause-Effect Relation","confidence":0.70})
-        if conclusions:
-            steps.append({"id":"b0_conc","label":_short(conclusions[0]),"category":"Concluding Statement","confidence":0.88})
-        conf  = _avg_confidence(steps)
-        compl = _completeness(steps, df)
-        branches.append({"name":"Main Argument Chain","description":"Follows the primary claims through evidence toward the conclusion.",
-                          "steps":steps,"branch_type":"causal",
-                          "scores":{"confidence":conf,"completeness":compl,"diversity":0.4,
-                                    "overall":round((conf+compl+0.4)/3,3)}})
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)
+            else:
+                raise RuntimeError(f"Groq API error: {e}") from e
 
-    # ── Branch 2: Adversarial (Debate) Branch ─────────────────────────────────
-    if counterclaims:
-        steps = []
-        if claims:
-            steps.append({"id":"b1_pos","label":_short(claims[0]),"category":"Claim","confidence":0.72})
-        for i, cc in enumerate(counterclaims[:2]):
-            steps.append({"id":f"b1_cc{i}","label":_short(cc),"category":"Counterclaim","confidence":0.68})
-            if i < len(rebuttals):
-                steps.append({"id":f"b1_r{i}","label":_short(rebuttals[i]),"category":"Rebuttal","confidence":0.71})
-        if conclusions:
-            steps.append({"id":"b1_conc","label":_short(conclusions[-1]),"category":"Concluding Statement","confidence":0.80})
-        conf  = _avg_confidence(steps)
-        compl = _completeness(steps, df)
-        div   = 0.75
-        branches.append({"name":"Debate / Adversarial Branch","description":"Explores the strongest opposing arguments and how the essay addresses them.",
-                          "steps":steps,"branch_type":"adversarial",
-                          "scores":{"confidence":conf,"completeness":compl,"diversity":div,
-                                    "overall":round((conf+compl+div)/3,3)}})
-
-    # ── Branch 3: Assumption / Hidden Premise Branch ──────────────────────────
-    if assumptions or (df.get("missing_evidence") is not None and df["missing_evidence"].any()):
-        steps = []
-        if claims:
-            steps.append({"id":"b2_c0","label":_short(claims[0]),"category":"Claim","confidence":0.65})
-        for i, a in enumerate(assumptions[:2]):
-            steps.append({"id":f"b2_a{i}","label":_short(a),"category":"Assumption","confidence":0.58})
-        missing_rows = df[df["missing_evidence"]==True].head(2)
-        for i,(_, row) in enumerate(missing_rows.iterrows()):
-            steps.append({"id":f"b2_me{i}","label":"⚠ Missing evidence for: "+_short(row["sentence"],40),
-                          "category":"Missing Evidence","confidence":0.3})
-        conf  = _avg_confidence(steps)
-        compl = 0.45
-        div   = 0.60
-        branches.append({"name":"Hidden Assumption Branch","description":"Surfaces implicit assumptions and evidence gaps.",
-                          "steps":steps,"branch_type":"assumption",
-                          "scores":{"confidence":conf,"completeness":compl,"diversity":div,
-                                    "overall":round((conf+compl+div)/3,3)}})
-
-    # ── Branch 4: Evidence Quality Branch ────────────────────────────────────
-    strong = df[df["category"]=="Strong Evidence"]["sentence"].tolist()
-    ev_steps = []
-    for i,s in enumerate(strong[:2]):
-        ev_steps.append({"id":f"b3_se{i}","label":_short(s),"category":"Strong Evidence","confidence":0.90})
-    for i,w in enumerate(weak_ev[:2]):
-        ev_steps.append({"id":f"b3_we{i}","label":_short(w),"category":"Weak Evidence","confidence":0.45})
-    if ev_steps:
-        conf  = _avg_confidence(ev_steps)
-        compl = 0.50; div = 0.55
-        branches.append({"name":"Evidence Quality Audit","description":"Distinguishes strong peer-reviewed evidence from weak anecdotal claims.",
-                          "steps":ev_steps,"branch_type":"evidential",
-                          "scores":{"confidence":conf,"completeness":compl,"diversity":div,
-                                    "overall":round((conf+compl+div)/3,3)}})
-
-    if not branches:
-        all_sents = df["sentence"].tolist()[:5]
-        branches.append({"name":"Linear Argument Thread","description":"Sequential reading of the main argument.",
-                          "steps":[{"id":f"fb_{i}","label":_short(s),"category":"Supporting Fact","confidence":0.5}
-                                    for i,s in enumerate(all_sents)],
-                          "branch_type":"causal",
-                          "scores":{"confidence":0.5,"completeness":0.5,"diversity":0.3,"overall":0.43}})
-    return branches
+    return ""
 
 
-def _avg_confidence(steps: list[dict]) -> float:
-    if not steps: return 0.5
-    return round(sum(s["confidence"] for s in steps)/len(steps), 3)
+def _parse_json(text: str):
+    text = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
+    start = min(
+        (text.find("{") if "{" in text else len(text)),
+        (text.find("[") if "[" in text else len(text)),
+    )
+    if start == len(text):
+        return {}
+    try:
+        return json.loads(text[start:])
+    except json.JSONDecodeError:
+        for op, cl in [("{", "}"), ("[", "]")]:
+            if op in text:
+                s = text.find(op)
+                e = text.rfind(cl)
+                if e > s:
+                    try:
+                        return json.loads(text[s:e+1])
+                    except Exception:
+                        pass
+        return {}
 
 
-def _completeness(steps: list[dict], df: pd.DataFrame) -> float:
-    key_types = {"Claim","Evidence","Counterclaim","Rebuttal","Concluding Statement"}
-    step_types = {s["category"] for s in steps}
-    present_in_essay = set(df["category"].unique())
-    available_keys = key_types & present_in_essay
-    if not available_keys: return 0.5
-    return round(len(step_types & available_keys)/len(available_keys), 3)
+# ===========================================================================
+# STEP 1 — GENERATE: LLM produces independent thought nodes
+# ===========================================================================
+
+_GENERATE_SYSTEM = """You are an expert argument analyst. Analyse essays by generating
+INDEPENDENT reasoning branches. Each branch examines the essay from a completely different
+analytical perspective. Return ONLY valid JSON, no prose before or after."""
+
+_GENERATE_USER = """Analyse this essay from 4 INDEPENDENT reasoning perspectives:
+
+1. "Causal Chain"     - trace the main claim -> evidence -> conclusion logical flow
+2. "Adversarial"      - focus on counterarguments, rebuttals, and dialectic strength
+3. "Assumption Audit" - surface hidden premises the argument silently depends on
+4. "Evidence Quality" - audit strength of evidence (strong/weak/missing)
+
+Essay:
+\"\"\"{essay}\"\"\"
+
+Discourse summary: {discourse_summary}
+
+Return a JSON array of 4 branch objects:
+[{{
+  "name": "<branch name>",
+  "branch_type": "<causal|adversarial|assumption|evidential>",
+  "description": "<one sentence>",
+  "thought_nodes": [
+    {{
+      "node_id": "<type>_<index>",
+      "thought": "<the actual reasoning step>",
+      "category": "<Claim|Evidence|Counterclaim|Rebuttal|Assumption|Missing Evidence|Strong Evidence|Weak Evidence|Concluding Statement>",
+      "sentence_ref": "<quoted fragment max 60 chars from essay, or empty>",
+      "raw_confidence": <0.0-1.0>
+    }}
+  ]
+}}]
+Each branch must have 3-6 thought nodes."""
 
 
-def rank_branches(branches: list[dict]) -> list[dict]:
-    return sorted(branches, key=lambda b: b["scores"]["overall"], reverse=True)
+def _generate_thought_nodes(essay: str, df: pd.DataFrame) -> list[dict]:
+    counts = df["category"].value_counts().to_dict()
+    discourse_summary = "; ".join(f"{k}: {v}" for k, v in counts.items())
+    prompt = _GENERATE_USER.format(essay=essay[:3000], discourse_summary=discourse_summary)
+    raw = _call_groq(_GENERATE_SYSTEM, prompt, max_tokens=2000)
+    parsed = _parse_json(raw)
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict) and "branches" in parsed:
+        return parsed["branches"]
+    return []
 
 
-def merge_branches(branches: list[dict]) -> dict:
-    if not branches: return {}
-    ranked = rank_branches(branches)
-    merged_steps: list[dict] = []
-    seen: set = set()
-    for branch in ranked:
-        for step in branch["steps"]:
-            key = step["label"][:40]
-            if key not in seen and step["confidence"] >= 0.5:
-                merged_steps.append(step); seen.add(key)
-            if len(merged_steps) >= 8: break
-        if len(merged_steps) >= 8: break
-    avg_conf  = _avg_confidence(merged_steps)
-    avg_compl = sum(b["scores"]["completeness"] for b in branches)/len(branches)
-    avg_div   = sum(b["scores"]["diversity"] for b in branches)/len(branches)
-    return {"name":"Synthesised Best Path","description":"Merged from highest-confidence steps across all branches.",
-            "steps":merged_steps,"branch_type":"synthesis",
-            "scores":{"confidence":round(avg_conf,3),"completeness":round(avg_compl,3),
-                      "diversity":round(avg_div,3),"overall":round((avg_conf+avg_compl+avg_div)/3,3)}}
+# ===========================================================================
+# STEP 2 — SCORE: LLM scores each thought node
+# ===========================================================================
+
+_SCORE_SYSTEM = """You are a rigorous argumentation judge. Score reasoning nodes
+from essay analysis. Return ONLY valid JSON."""
+
+_SCORE_USER = """Score each thought node on three dimensions (0.0-1.0 each):
+- logical_validity: Is the reasoning step logically sound?
+- evidence_support: Is this node grounded in actual essay content?
+- completeness:     Does this node fully capture the aspect it targets?
+
+Nodes to score:
+{nodes_json}
+
+Return JSON array:
+[{{"node_id": "<id>", "logical_validity": <float>, "evidence_support": <float>,
+   "completeness": <float>, "score_note": "<one sentence justification>"}}]"""
 
 
-def generate_final_verdict(branches: list[dict], stats: dict) -> dict:
-    ranked = rank_branches(branches)
+def _score_thought_nodes(branches: list[dict]) -> dict[str, dict]:
+    all_nodes = []
+    for branch in branches:
+        for node in branch.get("thought_nodes", []):
+            all_nodes.append({
+                "node_id": node.get("node_id", ""),
+                "thought": node.get("thought", "")[:200],
+                "category": node.get("category", ""),
+                "raw_confidence": node.get("raw_confidence", 0.5),
+            })
+    if not all_nodes:
+        return {}
+    raw = _call_groq(_SCORE_SYSTEM,
+                       _SCORE_USER.format(nodes_json=json.dumps(all_nodes, indent=2)),
+                       max_tokens=1500)
+    parsed = _parse_json(raw)
+    scores: dict[str, dict] = {}
+    if isinstance(parsed, list):
+        for item in parsed:
+            nid = item.get("node_id", "")
+            if nid:
+                scores[nid] = item
+    return scores
+
+
+# ===========================================================================
+# STEP 3 — AGGREGATE: LLM reasons OVER the scored graph
+# ===========================================================================
+
+_AGG_SYSTEM = """You are a master argument synthesiser. You receive a scored
+Graph-of-Thought and reason OVER the graph to produce a holistic synthesis.
+Return ONLY valid JSON."""
+
+_AGG_USER = """Reason OVER this scored Graph-of-Thought (multiple branches, each with
+independently scored nodes) to identify:
+1. Which reasoning paths are strongest end-to-end
+2. Where branches REINFORCE each other (convergent evidence)
+3. Where branches CONTRADICT each other (conflicting signals)
+4. What the graph as a whole reveals about essay quality
+
+Scored GoT graph:
+{got_graph_json}
+
+Return JSON:
+{{
+  "cross_branch_insights": ["<insight about branch relationships>"],
+  "convergent_signals": ["<thing multiple branches agree on>"],
+  "contradictory_signals": ["<thing branches disagree on>"],
+  "graph_level_verdict": "<2-3 sentence synthesis of what the WHOLE graph reveals>",
+  "strongest_path_ids": ["<node_ids of highest-value chain across branches>"],
+  "aggregation_confidence": <0.0-1.0>
+}}"""
+
+
+def _aggregate_over_graph(branches: list[dict], node_scores: dict) -> dict:
+    got_graph = []
+    for branch in branches:
+        scored_nodes = []
+        for node in branch.get("thought_nodes", []):
+            nid = node.get("node_id", "")
+            sc = node_scores.get(nid, {})
+            composite = (
+                sc.get("logical_validity", 0.5) * 0.4
+                + sc.get("evidence_support", 0.5) * 0.4
+                + sc.get("completeness", 0.5) * 0.2
+            )
+            scored_nodes.append({
+                "node_id": nid,
+                "thought": node.get("thought", "")[:150],
+                "category": node.get("category", ""),
+                "composite_score": round(composite, 3),
+                "score_note": sc.get("score_note", ""),
+            })
+        got_graph.append({
+            "name": branch.get("name", ""),
+            "branch_type": branch.get("branch_type", ""),
+            "description": branch.get("description", ""),
+            "scored_nodes": scored_nodes,
+        })
+    raw = _call_groq(_AGG_SYSTEM,
+                       _AGG_USER.format(got_graph_json=json.dumps(got_graph, indent=2)),
+                       max_tokens=1000)
+    parsed = _parse_json(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# ===========================================================================
+# STEP 4 — REFINE: LLM produces final Toulmin verdict
+# ===========================================================================
+
+_REFINE_SYSTEM = """You are a final-stage essay evaluator with access to a complete
+Graph-of-Thought analysis. Produce the definitive scoring and feedback.
+Return ONLY valid JSON."""
+
+_REFINE_USER = """Final REFINEMENT step of Graph-of-Thought essay evaluation.
+
+Score using the Toulmin rubric:
+  T1 Claim Clarity (0-3): is thesis specific and arguable?
+  T2 Evidence Quality (0-4): are claims backed by credible evidence?
+  T3 Warrant/Reasoning (0-3): is the logical connection explained?
+  T4 Counterargument (0-2): does essay acknowledge opposing views?
+  T5 Rebuttal Quality (0-2): are counterarguments effectively rebutted?
+  T6 Structural Cohesion (0-2): is argument organised and coherent?
+
+GoT synthesis:
+{aggregation_json}
+
+Discourse stats:
+{stats_json}
+
+Top nodes by score:
+{top_nodes_json}
+
+Return JSON:
+{{
+  "toulmin_scores": {{
+    "T1_claim_clarity":       {{"raw": <0-3>, "note": "<justification>"}},
+    "T2_evidence_quality":    {{"raw": <0-4>, "note": "<justification>"}},
+    "T3_warrant_reasoning":   {{"raw": <0-3>, "note": "<justification>"}},
+    "T4_counterargument":     {{"raw": <0-2>, "note": "<justification>"}},
+    "T5_rebuttal_quality":    {{"raw": <0-2>, "note": "<justification>"}},
+    "T6_structural_cohesion": {{"raw": <0-2>, "note": "<justification>"}}
+  }},
+  "overall_score": <0.0-10.0>,
+  "verdict_text": "<2-3 sentence overall verdict>",
+  "strengths": ["<strength 1>", "<strength 2>", "<strength 3>"],
+  "weaknesses": ["<weakness 1>", "<weakness 2>"],
+  "improvements": ["<improvement 1>", "<improvement 2>", "<improvement 3>"],
+  "got_synthesis_note": "<one sentence on what GoT revealed beyond single-pass analysis>"
+}}"""
+
+
+def _refine_verdict(aggregation: dict, branches: list[dict],
+                    node_scores: dict, stats: dict) -> dict:
+    all_scored = []
+    for branch in branches:
+        for node in branch.get("thought_nodes", []):
+            nid = node.get("node_id", "")
+            sc = node_scores.get(nid, {})
+            composite = (
+                sc.get("logical_validity", 0.5) * 0.4
+                + sc.get("evidence_support", 0.5) * 0.4
+                + sc.get("completeness", 0.5) * 0.2
+            )
+            all_scored.append({
+                "node_id": nid, "branch": branch.get("name", ""),
+                "thought": node.get("thought", "")[:120],
+                "composite": round(composite, 3),
+            })
+    top_nodes = sorted(all_scored, key=lambda x: x["composite"], reverse=True)[:8]
+    raw = _call_groq(
+        _REFINE_SYSTEM,
+        _REFINE_USER.format(
+            aggregation_json=json.dumps(aggregation, indent=2),
+            stats_json=json.dumps(stats, indent=2),
+            top_nodes_json=json.dumps(top_nodes, indent=2),
+        ),
+        max_tokens=1500,
+    )
+    parsed = _parse_json(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# ===========================================================================
+# PUBLIC API
+# ===========================================================================
+
+def run_got_pipeline(essay: str, df: pd.DataFrame, stats: dict) -> dict:
+    """
+    Execute the full 4-step Graph-of-Thought pipeline:
+      1. Generate thought nodes (LLM)
+      2. Score each node (LLM)
+      3. Aggregate over the graph (LLM)
+      4. Refine to final verdict (LLM)
+    Returns a dict compatible with the existing app.py session state.
+    """
+    raw_branches = _generate_thought_nodes(essay, df)
+    if not raw_branches:
+        return _fallback_result(stats, df)
+
+    node_scores = _score_thought_nodes(raw_branches)
+    branches    = _annotate_branches(raw_branches, node_scores)
+    aggregation = _aggregate_over_graph(branches, node_scores)
+    refinement  = _refine_verdict(aggregation, branches, node_scores, stats)
+
+    return _build_result(branches, node_scores, aggregation, refinement, stats, df)
+
+
+def _annotate_branches(raw_branches: list[dict], node_scores: dict) -> list[dict]:
+    annotated = []
+    for branch in raw_branches:
+        nodes = branch.get("thought_nodes", [])
+        composites = []
+        enriched = []
+        for node in nodes:
+            nid = node.get("node_id", "")
+            sc = node_scores.get(nid, {})
+            composite = (
+                sc.get("logical_validity", node.get("raw_confidence", 0.5)) * 0.4
+                + sc.get("evidence_support", node.get("raw_confidence", 0.5)) * 0.4
+                + sc.get("completeness", node.get("raw_confidence", 0.5)) * 0.2
+            )
+            composites.append(composite)
+            enriched.append({
+                **node,
+                "label":      node.get("thought", "")[:55],
+                "confidence": round(composite, 3),
+                "scores":     sc,
+            })
+        avg_conf = round(sum(composites) / max(len(composites), 1), 3)
+        key_types = {"Claim", "Evidence", "Counterclaim", "Rebuttal", "Concluding Statement"}
+        step_types = {n.get("category", "") for n in nodes}
+        completeness = round(len(step_types & key_types) / max(len(key_types), 1), 3)
+        diversity = round(min(1.0, len(step_types) / 5.0), 3)
+        overall = round((avg_conf + completeness + diversity) / 3, 3)
+        annotated.append({
+            **branch,
+            "steps": enriched,
+            "scores": {
+                "confidence": avg_conf, "completeness": completeness,
+                "diversity": diversity, "overall": overall,
+            },
+        })
+    return annotated
+
+
+def _build_result(branches, node_scores, aggregation, refinement, stats, df) -> dict:
+    ranked = sorted(branches, key=lambda b: b["scores"]["overall"], reverse=True)
     best   = ranked[0] if ranked else {}
-    worst  = ranked[-1] if ranked else {}
 
-    total    = stats.get("total_sentences", 1)
-    ev_cnt   = stats.get("evidence_count", 0)
-    unsup    = stats.get("unsupported_count", 0)
-    cc_cnt   = stats.get("counterclaim_count", 0)
-    reb_cnt  = stats.get("rebuttal_count", 0)
-    fall_cnt = stats.get("fallacy_count", 0)
-    strong   = stats.get("strong_evidence_count", 0)
-    weak_ev  = stats.get("weak_evidence_count", 0)
-    missing  = stats.get("missing_evidence_count", 0)
+    ts = refinement.get("toulmin_scores", {})
+    maxes = {
+        "T1_claim_clarity": 3.0, "T2_evidence_quality": 4.0,
+        "T3_warrant_reasoning": 3.0, "T4_counterargument": 2.0,
+        "T5_rebuttal_quality": 2.0, "T6_structural_cohesion": 2.0,
+    }
+    display_names = {
+        "T1_claim_clarity":       "T1 — Claim Clarity",
+        "T2_evidence_quality":    "T2 — Evidence Quality",
+        "T3_warrant_reasoning":   "T3 — Warrant/Reasoning",
+        "T4_counterargument":     "T4 — Counterargument",
+        "T5_rebuttal_quality":    "T5 — Rebuttal Quality",
+        "T6_structural_cohesion": "T6 — Structural Cohesion",
+    }
+    trait_breakdown = {}
+    raw_total = 0.0
+    for key, mx in maxes.items():
+        raw  = float(ts.get(key, {}).get("raw", 0.0))
+        raw  = min(raw, mx)
+        note = ts.get(key, {}).get("note", "")
+        s10  = round((raw / mx) * 10.0, 1)
+        raw_total += raw
+        trait_breakdown[display_names[key]] = {"raw": raw, "max": mx, "note": note, "score_10": s10}
+    raw_max = sum(maxes.values())
 
-    strengths, weaknesses, improvements = [], [], []
+    llm_score = refinement.get("overall_score")
+    if isinstance(llm_score, (int, float)) and 0 <= llm_score <= 10:
+        overall = round(float(llm_score), 1)
+    else:
+        overall = round(max(1.0, (raw_total / raw_max) * 10.0), 1)
 
-    if strong >= 2:          strengths.append("Uses strong, cited evidence to back key claims.")
-    elif ev_cnt >= 3:        strengths.append("Several evidence units support the argument.")
-    if cc_cnt >= 1:          strengths.append("Acknowledges opposing viewpoints.")
-    if reb_cnt >= 1:         strengths.append("Rebuttals strengthen the author's position.")
-    if unsup == 0:           strengths.append("All main claims appear to be supported.")
-    if fall_cnt == 0:        strengths.append("No obvious logical fallacies detected.")
+    trait_breakdown["_raw_total"]  = raw_total
+    trait_breakdown["_raw_max"]    = raw_max
+    trait_breakdown["_normalised"] = overall
 
-    if unsup >= 2:           weaknesses.append(f"{unsup} unsupported claim(s) significantly reduce credibility.")
-    if fall_cnt >= 1:        weaknesses.append(f"{fall_cnt} logical fallacy/fallacies detected (e.g. 'everyone knows', slippery slope).")
-    if weak_ev >= 2:         weaknesses.append(f"{weak_ev} anecdotal/opinion-based evidence units — replace with data.")
-    if missing >= 2:         weaknesses.append(f"{missing} claim(s) have no supporting evidence in nearby sentences.")
-    if cc_cnt == 0:          weaknesses.append("No counterclaims — essay ignores opposing arguments entirely.")
-    if reb_cnt == 0 and cc_cnt >= 1: weaknesses.append("Counterclaims raised but not rebutted.")
-    if ev_cnt < 2:           weaknesses.append("Very little evidence — the argument relies almost entirely on assertion.")
-    if strong == 0 and ev_cnt > 0: weaknesses.append("No strong (cited/statistical) evidence — all evidence is weak or anecdotal.")
+    # Synthesised path from aggregation
+    strongest_ids = aggregation.get("strongest_path_ids", [])
+    all_nodes_map = {
+        node.get("node_id", ""): node
+        for branch in branches for node in branch.get("steps", [])
+    }
+    merged_steps = [all_nodes_map[nid] for nid in strongest_ids if nid in all_nodes_map]
+    if not merged_steps and best:
+        merged_steps = best.get("steps", [])[:6]
+    avg_mc = round(sum(s.get("confidence", 0.5) for s in merged_steps) / max(len(merged_steps), 1), 3) if merged_steps else 0.5
+    merged_branch = {
+        "name": "GoT Synthesised Path",
+        "description": aggregation.get("graph_level_verdict", "Merged from highest-scoring nodes."),
+        "steps": merged_steps,
+        "scores": {
+            "confidence": avg_mc,
+            "completeness": best.get("scores", {}).get("completeness", 0.5),
+            "diversity": best.get("scores", {}).get("diversity", 0.5),
+            "overall": round((avg_mc + best.get("scores", {}).get("overall", 0.5)) / 2, 3),
+        },
+    }
 
-    if not strengths:        strengths.append("Essay states a clear position.")
-    if not weaknesses:       weaknesses.append("No major structural weaknesses detected.")
-
-    if unsup > 0:            improvements.append("Back every claim with a specific statistic, study, or named source.")
-    if cc_cnt == 0:          improvements.append("Add at least one counterclaim and rebut it — this shows critical thinking.")
-    if fall_cnt > 0:         improvements.append("Remove phrases like 'everyone knows' or 'obviously' — replace with evidence.")
-    if weak_ev > 0:          improvements.append("Replace anecdotal evidence ('my friend said', 'I think') with peer-reviewed sources.")
-    if missing > 0:          improvements.append("Ensure every claim paragraph ends with supporting evidence.")
-    improvements.append("Use transitional phrases between paragraphs to improve logical flow.")
-
-    overall_score = _compute_overall_score(stats, ranked)
+    verdict = {
+        "verdict_text":    refinement.get("verdict_text", _verdict_summary(overall)),
+        "overall_score":   overall,
+        "trait_breakdown": trait_breakdown,
+        "strengths":       refinement.get("strengths", ["Essay presents a recognisable argument."]),
+        "weaknesses":      refinement.get("weaknesses", ["See GoT analysis for details."]),
+        "improvements":    refinement.get("improvements", ["Strengthen evidence quality."]),
+        "scoring_model":   "GoT + Toulmin (1958) — LLM 4-step pipeline, 6-trait rubric",
+        "best_branch":     best.get("name", ""),
+        "best_score":      best.get("scores", {}).get("overall", 0.0),
+        "weak_branch":     ranked[-1].get("name", "") if ranked else "",
+        "weak_score":      ranked[-1].get("scores", {}).get("overall", 0.0) if ranked else 0.0,
+        "got_cross_branch_insights": aggregation.get("cross_branch_insights", []),
+        "got_convergent_signals":    aggregation.get("convergent_signals", []),
+        "got_contradictory_signals": aggregation.get("contradictory_signals", []),
+        "got_graph_verdict":         aggregation.get("graph_level_verdict", ""),
+        "got_synthesis_note":        refinement.get("got_synthesis_note", ""),
+    }
 
     return {
-        "verdict_text":  _verdict_summary(overall_score),
-        "overall_score": overall_score,
-        "strengths":     strengths,
-        "weaknesses":    weaknesses,
-        "improvements":  improvements,
-        "best_branch":   best.get("name",""),
-        "best_score":    best.get("scores",{}).get("overall",0.0),
-        "weak_branch":   worst.get("name",""),
-        "weak_score":    worst.get("scores",{}).get("overall",0.0),
+        "branches":        ranked,
+        "ranked_branches": ranked,
+        "best_branch":     best,
+        "merged_branch":   merged_branch,
+        "verdict":         verdict,
+        "node_scores":     node_scores,
+        "aggregation":     aggregation,
+        "got_pipeline":    True,
     }
 
 
-def _verdict_summary(score: float) -> str:
-    if score >= 8.0:
-        return "**Strong Argument** — Well-structured, evidence-rich, and logically sound."
-    elif score >= 6.5:
-        return "**Good Argument** — Solid foundation with minor gaps in evidence or counterargument coverage."
-    elif score >= 5.0:
-        return "**Moderate Argument** — Has a clear position but needs more evidence and fewer unsupported claims."
-    elif score >= 3.5:
-        return "**Developing Argument** — The position is stated but the argument lacks evidence, logic, and structure."
-    elif score >= 2.0:
-        return "**Weak Argument** — Relies heavily on assertion, fallacies, and anecdote. Substantial revision needed."
-    else:
-        return "**Very Weak Argument** — Little to no evidence, multiple fallacies, no engagement with counterarguments."
+# ===========================================================================
+# Fallback (if API unavailable)
+# ===========================================================================
+
+def _fallback_result(stats: dict, df: pd.DataFrame) -> dict:
+    score, trait_breakdown = _compute_toulmin_score_local(stats, df)
+    verdict = {
+        "verdict_text":    _verdict_summary(score),
+        "overall_score":   score,
+        "trait_breakdown": trait_breakdown,
+        "strengths":       ["Essay presents an identifiable argument."],
+        "weaknesses":      ["GoT pipeline unavailable — API not reachable."],
+        "improvements":    ["Ensure ANTHROPIC_API_KEY is set and retry."],
+        "scoring_model":   "Local Toulmin fallback (GoT API unavailable)",
+        "best_branch":     "Fallback Branch", "best_score": 0.5,
+        "weak_branch":     "", "weak_score": 0.0,
+        "got_pipeline":    False,
+    }
+    fallback_branch = {
+        "name": "Linear Argument Thread",
+        "description": "Sequential reading (GoT unavailable).",
+        "steps": [
+            {"node_id": f"fb_{i}", "label": _short(s), "thought": s,
+             "category": "Supporting Fact", "confidence": 0.5}
+            for i, s in enumerate(df["sentence"].tolist()[:5])
+        ],
+        "scores": {"confidence": 0.5, "completeness": 0.5, "diversity": 0.3, "overall": 0.43},
+    }
+    return {
+        "branches": [fallback_branch], "ranked_branches": [fallback_branch],
+        "best_branch": fallback_branch, "merged_branch": fallback_branch,
+        "verdict": verdict, "node_scores": {}, "aggregation": {}, "got_pipeline": False,
+    }
 
 
-def _compute_overall_score(stats: dict, ranked_branches: list[dict]) -> float:
-    """
-    Rubric-based scoring out of 10. Each dimension contributes a bounded portion.
-    Designed so a weak essay (no citations, fallacies, no counterclaims) scores 1–3
-    and a strong essay (cited evidence, rebuttals, no fallacies) scores 7–10.
-    """
-    total    = max(stats.get("total_sentences", 1), 1)
-    ev_cnt   = stats.get("evidence_count", 0)
+# ===========================================================================
+# Backward-compat wrappers (called by explanation_engine.compute_subscores)
+# ===========================================================================
+
+def generate_branches(df: pd.DataFrame) -> list[dict]:
+    return []
+
+
+def rank_branches(branches: list[dict]) -> list[dict]:
+    return sorted(branches, key=lambda b: b.get("scores", {}).get("overall", 0), reverse=True)
+
+
+def merge_branches(branches: list[dict]) -> dict:
+    if not branches:
+        return {}
+    best = rank_branches(branches)[0]
+    return {
+        "name": "Synthesised Best Path",
+        "description": "Merged from highest-scoring branches.",
+        "steps": best.get("steps", [])[:6],
+        "scores": best.get("scores", {}),
+    }
+
+
+def generate_final_verdict(branches: list[dict], stats: dict, df=None) -> dict:
+    if df is None:
+        df = pd.DataFrame()
+    score, trait_breakdown = _compute_toulmin_score_local(stats, df)
+    return {
+        "verdict_text":    _verdict_summary(score),
+        "overall_score":   score,
+        "trait_breakdown": trait_breakdown,
+        "strengths":       [], "weaknesses":   [], "improvements":  [],
+        "scoring_model":   "Local Toulmin (subscores only)",
+        "best_branch":     branches[0].get("name", "") if branches else "",
+        "best_score":      branches[0].get("scores", {}).get("overall", 0.0) if branches else 0.0,
+        "weak_branch": "", "weak_score": 0.0,
+    }
+
+
+# ===========================================================================
+# Local Toulmin scoring (for subscores + fallback)
+# ===========================================================================
+
+def _score_T1_claim_clarity(stats):
+    MAX = 3.0
+    claim_cnt = stats.get("claim_count", 0)
+    unsup = stats.get("unsupported_count", 0)
+    total = max(stats.get("total_sentences", 1), 1)
+    supported = max(0, claim_cnt - unsup)
+    if claim_cnt == 0 and total >= 5:
+        return 1.5, MAX, "Position implied but no explicit claim detected."
+    if claim_cnt == 0:
+        return 0.0, MAX, "No identifiable claim or position found."
+    if unsup >= claim_cnt:
+        return 1.0, MAX, "Claims present but all unsupported."
+    if supported >= 2:
+        return 3.0, MAX, "Clear, specific claims with positions stated."
+    if supported == 1:
+        return 2.0, MAX, "One clear supported claim."
+    return 1.5, MAX, "Claim present but specificity could be improved."
+
+
+def _score_T2_evidence_quality(stats):
+    MAX = 4.0
     strong   = stats.get("strong_evidence_count", 0)
+    plain_ev = max(0, stats.get("evidence_count", 0) - strong - stats.get("weak_evidence_count", 0))
     weak_ev  = stats.get("weak_evidence_count", 0)
-    unsup    = stats.get("unsupported_count", 0)
-    fall_cnt = stats.get("fallacy_count", 0)
-    cc_cnt   = stats.get("counterclaim_count", 0)
-    reb_cnt  = stats.get("rebuttal_count", 0)
     missing  = stats.get("missing_evidence_count", 0)
     claim_cnt = max(stats.get("claim_count", 1), 1)
+    ev_weighted = strong * 1.0 + plain_ev * 0.5 + weak_ev * 0.1
+    ev_per_claim = ev_weighted / claim_cnt
+    if strong == 0 and plain_ev == 0 and weak_ev == 0:
+        return 0.0, MAX, "No evidence found."
+    if strong == 0 and weak_ev > 0:
+        return max(0.5, min(1.5, ev_per_claim * 1.5)), MAX, "Only anecdotal evidence."
+    if strong >= 1 and ev_per_claim >= 1.0:
+        return min(4.0, 2.5 + strong * 0.4 - missing * 0.3), MAX, f"{strong} strong evidence unit(s)."
+    return min(2.5, 1.0 + ev_per_claim * 1.5 - missing * 0.2), MAX, "Some evidence but gaps remain."
 
-    # ── 1. Evidence Quality (max 3.0) ────────────────────────────────────────
-    # Strong evidence (cited/statistical) = 0.6 pts each, cap 2.4
-    # Plain evidence = 0.25 pts each
-    # Weak/anecdotal evidence = 0.05 pts each (barely counts)
-    plain_ev = max(0, ev_cnt - strong - weak_ev)
-    ev_score = min(3.0,
-        strong  * 0.60 +
-        plain_ev * 0.25 +
-        weak_ev * 0.05
-    )
 
-    # ── 2. Evidence Coverage (max 2.0) ───────────────────────────────────────
-    # What fraction of claims have supporting evidence?
-    supported_claims = max(0, claim_cnt - unsup - missing)
-    coverage = supported_claims / claim_cnt
-    coverage_score = coverage * 2.0
-
-    # ── 3. Counterargument Engagement (max 2.0) ───────────────────────────────
-    if cc_cnt == 0:
-        cc_score = 0.0          # no engagement at all
-    elif reb_cnt == 0:
-        cc_score = cc_cnt * 0.5 # raised but not rebutted
-        cc_score = min(1.0, cc_score)
+def _score_T3_warrant_reasoning(stats, ranked_branches):
+    MAX = 3.0
+    fallacy_cnt  = stats.get("fallacy_count", 0)
+    unsup        = stats.get("unsupported_count", 0)
+    branch_score = ranked_branches[0]["scores"]["overall"] if ranked_branches else 0.4
+    raw = max(0.0, branch_score * 2.0 - fallacy_cnt * 0.5 - unsup * 0.3)
+    if fallacy_cnt >= 3:
+        note = f"{fallacy_cnt} logical fallacies undermine reasoning."
+    elif fallacy_cnt >= 1:
+        note = f"{fallacy_cnt} fallacy detected."
+    elif branch_score >= 0.65:
+        note = "Reasoning chain is logically structured."
     else:
-        cc_score = min(2.0, cc_cnt * 0.7 + reb_cnt * 0.6)
+        note = "Logical connections are weak."
+    return round(min(MAX, raw), 2), MAX, note
 
-    # ── 4. Logical Integrity (max 2.0) ───────────────────────────────────────
-    # Start at 2.0, subtract for fallacies and unsupported claims
-    logic_score = 2.0
-    logic_score -= fall_cnt * 0.6      # each fallacy costs 0.6
-    logic_score -= unsup * 0.35        # each unsupported claim costs 0.35
-    logic_score -= missing * 0.20      # each missing evidence gap costs 0.2
-    logic_score = max(0.0, logic_score)
 
-    # ── 5. Structure & Argument Quality (max 1.0) ────────────────────────────
-    # Based on best branch overall score
-    branch_quality = ranked_branches[0]["scores"]["overall"] if ranked_branches else 0.4
-    structure_score = branch_quality * 1.0  # maps 0–1 → 0–1
+def _score_T4_counterargument(stats):
+    MAX = 2.0
+    cc = stats.get("counterclaim_count", 0)
+    if cc == 0:  return 0.0, MAX, "No counterarguments."
+    if cc == 1:  return 1.5, MAX, "One counterargument acknowledged."
+    return 2.0, MAX, f"{cc} counterarguments acknowledged."
 
-    # ── Total ─────────────────────────────────────────────────────────────────
-    raw = ev_score + coverage_score + cc_score + logic_score + structure_score
-    # raw is out of 10 (3 + 2 + 2 + 2 + 1)
 
-    # Hard floor/ceiling
-    return round(min(10.0, max(1.0, raw)), 1)
+def _score_T5_rebuttal_quality(stats):
+    MAX = 2.0
+    cc  = stats.get("counterclaim_count", 0)
+    reb = stats.get("rebuttal_count", 0)
+    if cc == 0:   return 0.0, MAX, "No counterarguments — rebuttal N/A."
+    if reb == 0:  return 0.0, MAX, "Counterarguments raised but not rebutted."
+    if reb >= cc: return 2.0, MAX, f"All {cc} counterargument(s) rebutted."
+    return round((reb / cc) * 1.5, 2), MAX, f"{reb}/{cc} counterarguments rebutted."
+
+
+def _score_T6_structural_cohesion(stats, df):
+    MAX = 2.0
+    cats = set(df["category"].unique()) if df is not None and not df.empty else set()
+    pts = sum([
+        "Lead" in cats,
+        "Position" in cats or stats.get("claim_count", 0) > 0,
+        "Concluding Statement" in cats,
+        stats.get("evidence_count", 0) > 0,
+    ])
+    raw = max(0.0, (pts / 4.0) * 2.0 - stats.get("fallacy_count", 0) * 0.2)
+    note = ("Well-structured essay." if pts == 4
+            else "Basic structure but missing components." if pts >= 2
+            else "Weak structure.")
+    return round(raw, 2), MAX, note
+
+
+def _compute_toulmin_score_local(stats: dict, df: pd.DataFrame) -> tuple:
+    dummy = [{"scores": {"overall": 0.5}}]
+    t1r, t1m, t1n = _score_T1_claim_clarity(stats)
+    t2r, t2m, t2n = _score_T2_evidence_quality(stats)
+    t3r, t3m, t3n = _score_T3_warrant_reasoning(stats, dummy)
+    t4r, t4m, t4n = _score_T4_counterargument(stats)
+    t5r, t5m, t5n = _score_T5_rebuttal_quality(stats)
+    t6r, t6m, t6n = _score_T6_structural_cohesion(stats, df)
+    raw_total = t1r + t2r + t3r + t4r + t5r + t6r
+    raw_max   = t1m + t2m + t3m + t4m + t5m + t6m
+    overall   = max(1.0, round((raw_total / raw_max) * 10.0, 1))
+    trait_breakdown = {
+        "T1 — Claim Clarity":       {"raw": t1r, "max": t1m, "note": t1n, "score_10": round((t1r/t1m)*10,1)},
+        "T2 — Evidence Quality":    {"raw": t2r, "max": t2m, "note": t2n, "score_10": round((t2r/t2m)*10,1)},
+        "T3 — Warrant/Reasoning":   {"raw": t3r, "max": t3m, "note": t3n, "score_10": round((t3r/t3m)*10,1)},
+        "T4 — Counterargument":     {"raw": t4r, "max": t4m, "note": t4n, "score_10": round((t4r/t4m)*10,1)},
+        "T5 — Rebuttal Quality":    {"raw": t5r, "max": t5m, "note": t5n, "score_10": round((t5r/t5m)*10,1)},
+        "T6 — Structural Cohesion": {"raw": t6r, "max": t6m, "note": t6n, "score_10": round((t6r/t6m)*10,1)},
+        "_raw_total": raw_total, "_raw_max": raw_max, "_normalised": overall,
+    }
+    return overall, trait_breakdown
+
+
+def _verdict_summary(score: float) -> str:
+    if score >= 8.5:
+        return "**Exemplary Argument** — Meets the highest standard: cited evidence, engaged counterarguments, clear thesis, logical warrants."
+    if score >= 7.0:
+        return "**Proficient Argument** — Well-structured with good evidence. Minor gaps in counterargument or warrant quality."
+    if score >= 5.5:
+        return "**Developing Argument** — Position is clear but evidence quality and/or counterargument engagement need strengthening."
+    if score >= 3.5:
+        return "**Beginning Argument** — Basic claim present but lacks evidence, logical warrants, and engagement with opposition."
+    return "**Inadequate Argument** — Relies on assertion, logical fallacies, or anecdote. Fundamental structural revision required."
