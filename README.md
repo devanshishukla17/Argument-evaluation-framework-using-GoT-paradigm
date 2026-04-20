@@ -13,7 +13,7 @@ and a polished multi-page Streamlit interface.
 pip install -r requirements.txt
 
 # 2. Set your Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
+set GROQ_API_KEY=.....
 
 # 3. Run
 streamlit run app.py
@@ -34,7 +34,7 @@ Essay + Discourse Data
         ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STEP 1: GENERATE                                       │
-│  Claude independently generates 4 thought-node chains:  │
+│  Groq independently generates 4 thought-node chains:  │
 │  • Causal Chain (claim → evidence → conclusion flow)    │
 │  • Adversarial  (counterclaim/rebuttal dialectic)       │
 │  • Assumption Audit (hidden premises)                   │
@@ -45,7 +45,7 @@ Essay + Discourse Data
                      ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STEP 2: SCORE                                          │
-│  Claude scores every thought node independently:        │
+│  Groq scores every thought node independently:        │
 │  • logical_validity  (0.0 – 1.0)                       │
 │  • evidence_support  (0.0 – 1.0)                       │
 │  • completeness      (0.0 – 1.0)                       │
@@ -55,7 +55,7 @@ Essay + Discourse Data
                      ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STEP 3: AGGREGATE (the real GoT step)                  │
-│  Claude reasons OVER the whole scored graph:            │
+│  Groq reasons OVER the whole scored graph:            │
 │  • Identifies cross-branch reinforcing signals          │
 │  • Identifies cross-branch contradictions               │
 │  • Derives graph-level verdict (not per-branch)         │
@@ -65,7 +65,7 @@ Essay + Discourse Data
                      ▼
 ┌─────────────────────────────────────────────────────────┐
 │  STEP 4: REFINE                                         │
-│  Claude produces final Toulmin scoring using:           │
+│  Groq produces final Toulmin scoring using:           │
 │  • The aggregated graph-level insights                  │
 │  • Top-scoring nodes across all branches                │
 │  • Discourse statistics                                 │
